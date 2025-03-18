@@ -1,0 +1,180 @@
+module randt (
+    input clk,              // Clock signal
+    input rst,              // Reset signal
+    input i_Rx_Serial,      // Serial data input
+    output o_Rx_DV,         // Data Valid signal when a byte is received
+    output [7:0] o_Rx_Byte, // Received byte output
+    output active,          // Indicates if transmission is active
+    output reg tx           // Serial data output
+);
+
+    // State definitions for Transmit FSM
+    parameter IDLE = 3'b000;
+    parameter START = 3'b001;
+    parameter DATA_STATE = 3'b010;
+    parameter STOP = 3'b011;
+    parameter CLEAN = 3'b100;
+
+    parameter clks_bit = 434; // Clock cycles per bit duration
+
+    reg [2:0] current_state = IDLE; // Current state of Transmit FSM
+    reg [8:0] clk_count = 0;        // Clock counter for baud rate timing
+    reg [2:0] index_bit = 0;        // Bit index for data transmission
+    reg [7:0] data = 0;             // Data to be transmitted
+    reg active_reg = 0;             // Transmission active flag
+
+    // State definitions for Receive FSM
+    parameter S_IDLE = 3'b000;
+    parameter S_RX_START_BIT = 3'b001;
+    parameter S_RX_DATA_BITS = 3'b010;
+    parameter S_RX_STOP_BIT = 3'b011;
+    parameter S_CLEANUP = 3'b100;
+
+    reg r_Rx_Data_R = 1'b1;  // Register for synchronized serial input
+    reg r_Rx_Data = 1'b1;    // Delayed version of serial input
+
+    reg [12:0] r_Clock_Count = 0; // Clock counter for Receive FSM
+    reg [2:0] r_Bit_Index = 0;    // Bit index for receiving data
+    reg [7:0] r_Rx_Byte = 0;      // Storage for received byte
+    reg r_Rx_DV = 0;              // Data valid signal for reception
+    reg [2:0] r_SM_Main = S_IDLE; // Current state of Receive FSM
+
+    reg start_received = 0;  // Start bit detection flag
+    reg stop_received = 0;   // Stop bit detection flag
+
+    // Synchronizing the serial input to avoid metastability
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            r_Rx_Data_R <= 1'b1;
+            r_Rx_Data <= 1'b1;
+        end else begin
+            r_Rx_Data_R <= i_Rx_Serial;
+            r_Rx_Data <= r_Rx_Data_R;
+        end
+    end
+
+    // Receive FSM: Handles serial data reception
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            r_SM_Main <= S_IDLE;
+            r_Rx_DV <= 1'b0;
+            r_Clock_Count <= 0;
+            r_Bit_Index <= 0;
+            r_Rx_Byte <= 8'b0;
+            start_received <= 0;
+            stop_received <= 0;
+        end else begin
+            case (r_SM_Main)
+                S_IDLE: begin
+                    r_Rx_DV <= 1'b0;
+                    r_Clock_Count <= 0;
+                    r_Bit_Index <= 0;
+                    if (r_Rx_Data == 1'b0)  // Detect start bit
+                        r_SM_Main <= S_RX_START_BIT;
+                end
+
+                S_RX_START_BIT: begin
+                    if (r_Clock_Count == (clks_bit - 1) / 2) begin
+                        if (r_Rx_Data == 1'b0) begin
+                            r_Clock_Count <= 0;
+                            r_SM_Main <= S_RX_DATA_BITS;
+                        end else begin
+                            r_SM_Main <= S_IDLE;  // False start detected
+                        end
+                    end else begin
+                        r_Clock_Count <= r_Clock_Count + 1;
+                    end
+                end
+
+                S_RX_DATA_BITS: begin
+                    if (r_Clock_Count < clks_bit - 1) begin
+                        r_Clock_Count <= r_Clock_Count + 1;
+                    end else begin
+                        r_Clock_Count <= 0;
+                        r_Rx_Byte[r_Bit_Index] <= r_Rx_Data;  // Store received bit
+                        if (r_Bit_Index < 7) begin
+                            r_Bit_Index <= r_Bit_Index + 1;
+                        end else begin
+                            r_SM_Main <= S_RX_STOP_BIT;
+                        end
+                    end
+                end
+
+                S_RX_STOP_BIT: begin
+                    if (r_Clock_Count < clks_bit - 1) begin
+                        r_Clock_Count <= r_Clock_Count + 1;
+                    end else begin
+                        r_Rx_DV <= 1'b1;  // Indicate data is ready
+                        r_Clock_Count <= 0;
+                        r_SM_Main <= S_CLEANUP;
+                    end
+                end
+
+                S_CLEANUP: begin
+                    r_SM_Main <= S_IDLE;
+                    r_Rx_DV <= 1'b0;
+                end
+            endcase
+        end
+    end
+
+    assign o_Rx_DV = r_Rx_DV;
+    assign o_Rx_Byte = r_Rx_Byte;
+
+    // Transmit FSM: Handles serial data transmission
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            current_state <= IDLE;
+            tx <= 1'b1;
+            active_reg <= 0;
+            clk_count <= 0;
+            index_bit <= 0;
+        end else begin
+            case (current_state)
+                IDLE: begin
+                    if (o_Rx_DV) begin  // When data is ready, prepare for transmission
+                        data <= o_Rx_Byte;
+                        active_reg <= 1'b1;
+                        index_bit <= 0;
+                        current_state <= START;
+                    end
+                end
+
+                START: begin
+                    tx <= 1'b0;  // Send start bit
+                    if (clk_count < clks_bit - 1) clk_count <= clk_count + 1;
+                    else begin
+                        clk_count <= 0;
+                        current_state <= DATA_STATE;
+                    end
+                end
+
+                DATA_STATE: begin
+                    tx <= data[index_bit];  // Send data bits
+                    if (clk_count < clks_bit - 1) begin
+                        clk_count <= clk_count + 1;
+                    end else begin
+                        clk_count <= 0;
+                        if (index_bit < 7) begin
+                            index_bit <= index_bit + 1;
+                        end else begin
+                            current_state <= STOP;
+                        end
+                    end
+                end
+
+                STOP: begin
+                    tx <= 1'b1;  // Send stop bit
+                    if (clk_count < clks_bit - 1) clk_count <= clk_count + 1;
+                    else begin
+                        clk_count <= 0;
+                        current_state <= IDLE;  // Restart for next byte
+                    end
+                end
+            endcase
+        end
+    end
+
+    assign active = active_reg;  // Assign transmission active flag
+
+endmodule
